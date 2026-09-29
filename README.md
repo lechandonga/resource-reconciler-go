@@ -18,17 +18,21 @@
  defaulting                                                ├─ ordered Ensure / Remove
                                                            └─ CAS write (optimistic lock)
         ◄──────────────  DecisionSink (reason-coded log) ─┘
- MemStore (in-memory + atomic snapshot file, monotonic resourceVersion)
- FakeActuator (idempotent backend + transient/deterministic failure injection)
+MemStore (in-memory + atomic snapshot file, monotonic resourceVersion)
+ActualStore (in-memory, or per-file directory backend with fsync+rename)
+FakeActuator (durable-identity idempotent backend + failure/crash injection)
 ```
 
 - `pkg/apis`：版本化 wire 类型、严格解码、确定性默认值、跨对象校验、状态条件与原因码。
 - `pkg/storage`：带单调 `resourceVersion` 的进程内存储，支持 CAS（Create/Update/Delete）
   与原子快照（temp + rename），模拟控制面持久化。
-- `pkg/engine`：有界键控队列、时钟（真实/手动推进）、有界退避+抖动、幂等执行器、
-  带乐观锁重试与失败分类的调和核心。
-- `pkg/controller`：装配（worker 池、启动恢复、周期 resync、bounded 处理）与
-  对期望状态的 `Apply` / `Delete`。
+- `pkg/engine`：有界键控队列、时钟（真实/手动推进）、有界退避+抖动、
+  幂等且**跨重启持久化身份**的执行器、启动/周期所有权对账（reaper）、
+  带乐观锁重试与失败分类的调和核心，以及"动作↔记账"崩溃窗口注入。
+- `pkg/controller`：装配（worker 池、**分页、可取消、有超时**的启动恢复与
+  周期 resync 对账、bounded 处理）与对期望状态的 `Apply` / `Delete`。
+- `pkg/actual`：实际侧持久化后端。`DirStore` 把每个真实资源存成一个 JSON 文件，
+  写入走临时文件 + fsync + rename；强杀进程后磁盘上只有旧文件或新文件，没有撕裂记录。
 - `cmd/demo`：覆盖全部语义的本地演示，逐步打印**输入、判定（含原因码）、最终状态**。
 
 ---
@@ -62,6 +66,49 @@
 
 依赖就绪/被删除后通过 `DependencyEnqueuer` 触发被阻塞对象重新入队；
 周期 **resync** 作为兜底自愈错过的信号。
+
+### 2.2b 实际侧持久化与重启对账（本轮新增）
+
+控制面与实际侧现在**都**跨进程持久化，重启对用户无感：
+
+- **稳定身份**：真实资源的 `ResourceID` 由归属对象名确定性派生
+  （`res-<sha256(name)[:24]>`），旧版本记录在案的 ID 会被就地采纳。
+  因此无论重启多少次，同一个对象对应同一个真实资源；重建进程（全新内存、
+  同一实际目录）后再次 `Ensure` 只会得到 `Unchanged`，**不会再创建/更新/删除一次**。
+- **漂移纠正且不换身份**：实际资源被外部改坏（内容、甚至 ID 被换掉）时，
+  对账把内容纠回期望，身份以实际侧现存资源为准并回写记账，不新建第二个资源。
+- **崩溃窗口**：副作用与记账之间有三个窗口——`after-create` / `after-update` /
+  `after-remove`（动作已落盘、结果尚未写回 status 的瞬间）。钩子在这些点强杀进程，
+  重新拉起后：
+  - 已生效的创建/更新不会重复，记账补齐到磁盘上已存在的资源；
+  - 已生效的删除不会"复活"资源，删除阶段从 `actual=nil` 继续；
+  - 对账幂等可重入，恢复途中再次崩溃、反复重启，最终结果一致。
+
+**保留还是清理，依据确定且可追溯。** 启动与周期 resync 都对实际侧做一次所有权审计：
+
+| 实际侧资源的归属判定 | 处置 | 决策原因码 |
+|---|---|---|
+| 存在同名对象 **且** 带 finalizer | 保留，不动 | `ActualKept` |
+| 存在同名对象但无 finalizer（记账可能落后） | **保留**并交给正常调和，绝不先删 | `ActualKept`（defer） |
+| 控制面中**不存在**同名对象（确定无主） | 删除该实际资源 | `OrphanReclaimed` |
+
+只有"控制面无此对象"才是删除实际资源的依据；因此"资源有效、只是记账没落盘"
+（对象与 finalizer 已先于副作用持久化）永远不会被误判成残留。每个判定都写一条
+带原因码与解释的 `Decision`，可在日志里追溯为什么留、为什么删。
+
+### 2.2c 对账有界、可取消、可超时
+
+- **分页扫描**：控制面（`MemStore.ListKeysPage`）与实际侧（`Store.ListPage`）
+  都按游标分页，页大小 `Config.RecoveryPageSize`（默认 64）。实际资源很多时
+  不会一次性全部读进内存，也不会长时间卡住启动——审计在独立 goroutine 中进行，
+  恢复期间 `Apply` 写入照常受理并最终收敛。
+- **取消与超时**：每次审计通过 `context.WithTimeout(parent, RecoveryTimeout)`
+  限界（默认 30s）。等依赖就绪、退避重试、恢复扫描的每条路径都检查 ctx；
+  被取消/超时时尽快返回，并记录可区分的 `RecoveryCancelled` / `RecoveryTimedOut`，
+  下一次 resync 从断点继续。
+- **不无界排队**：审计入队同样走有界队列；满了就记录 `QueueOverflow` 并跳过该 key，
+  由下一轮审计兜底，不撑爆内存。
+- `Stats().Reclaimed` 给出本轮运行内回收的无主资源数，可观察、可断言。
 
 ### 2.3 乐观并发控制（OCC）
 
@@ -132,10 +179,12 @@
   关闭抖动源（传 `nil`）时结果完全确定，测试可复现。
 - 新的期望 generation 会**清空旧的失败/重试计数**，新输入不被旧失败绑架；
   同 generation 的重读不会被误判为"规格变更"。
-- **重启续作**：attempts、终态原因、`actual`、finalizer、删除时间戳全部持久化。
-  重启时把所有持久化对象入队一次，从已持久化阶段继续：
-  已生效的副作用不重复（执行器 `Remove` 对"已不存在"返回 no-op，
-  `Ensure` 对"已匹配"返回 `Unchanged`）。
+- **重启续作（控制面与实际侧都持久化）**：attempts、终态原因、`actual`、
+  finalizer、删除时间戳在控制面持久化；真实资源本身在 `actual.DirStore` 持久化，
+  身份跨重启稳定。重启时分页重新入队所有对象并对实际侧做一次所有权审计，从已持久化
+  阶段继续：已生效的副作用绝不重复（`Ensure` 对"已匹配"返回 `Unchanged`，
+  `Remove` 对"已不存在"返回 no-op）；动作已生效但记账未落下的资源被**就地补齐而非
+  重建**；确定无主的残留被回收。详见 §2.2b / §2.2c。
 
 ---
 
@@ -173,9 +222,32 @@ CGO_ENABLED=1 go test ./... -race -count=1
 CGO_ENABLED=1 go test ./... -race -count=5
 
 # 可运行演示：正常收敛、幂等、漂移修正、非法拒绝、瞬时/确定性失败、
-# 有序删除、重启续作，逐步打印输入/判定/最终状态
+# 有序删除、实际侧持久化重启续作，逐步打印输入/判定/最终状态
 go run ./cmd/demo
 ```
+
+演示的第 8 步会把控制面快照与实际资源目录都留在磁盘上（`-snapshot`、
+`-actual-dir` 可指定），用同一个 `-actual-dir` 重启即可看到资源被原样接管、
+副作用计数为 0，审计日志逐条给出 `ActualKept` / `OrphanReclaimed`。
+
+### 把崩溃点摆出来（强杀重现）
+
+崩溃窗口通过环境变量选择，进程在副作用**已落盘、记账尚未写回**的瞬间以退出码 77 自杀：
+
+```bash
+# 可选三个点：after-create / after-update / after-remove
+# RECONCILER_CRASH_KEY 可进一步限定到某个对象
+go run ./cmd/demo -actual-dir ./demo-actual -snapshot ./demo-snap.json
+RECONCILER_CRASH_POINT=after-create \
+  go run ./cmd/demo -actual-dir ./demo-actual -snapshot ./demo-snap.json
+# 再干净地拉起一次：资源身份不变、不重复副作用、记账补齐
+go run ./cmd/demo -actual-dir ./demo-actual -snapshot ./demo-snap.json
+```
+
+对应的自动化重现是 `pkg/controller/crash_test.go`：父进程用 `exec` 重新启动测试
+二进制，子进程在选定窗口 `os.Exit(77)`（真实强杀，不是模拟错误返回），父进程再
+启动一个干净进程断言最终身份、副作用次数与最终状态。覆盖创建、更新、删除三个窗口
+以及在恢复过程中反复崩溃的幂等性。
 
 ### 主要测试（以异常路径为主）
 
@@ -192,14 +264,27 @@ go run ./cmd/demo
 - `pkg/controller/controller_test.go`：并发热点对象收敛一致且执行器不并发、
   非法 spec 写库前被拒、队列溢出被拒绝并计数、**重启后续作且不重复副作用**、
   **重启续作删除不留孤儿**。
+- `pkg/actual/store_test.go`：目录后端跨实例读写身份一致、删除幂等、分页有序且有界、
+  外来文件（如控制面快照）不被误认成实际资源、非法 key 拒绝、ctx 取消生效。
+- `pkg/engine/actuator_durable_test.go`：持久后端重启后 `Ensure` 为 `Unchanged` 且
+  身份不变、外部漂移被同身份纠正、删除跨重启幂等、崩溃钩子在落盘后触发。
+- `pkg/engine/reaper_test.go`：所有权审计三分支（回收确定孤儿 / 保留 finalizer 资源 /
+  无 finalizer 先保留并交给调和），且响应取消。
+- `pkg/controller/recovery_test.go`：重启身份与副作用不重复、手动改坏实际资源被纠回、
+  孤儿被回收而有效未记账资源不被误清、恢复期间 30 路并发写入全部收敛、
+  取消立即返回与超时产生 `RecoveryCancelled`/`RecoveryTimedOut`、旧快照就地接管。
+- `pkg/controller/crash_test.go`：创建/更新/删除动作与记账之间强杀后的恢复，
+  以及恢复中反复崩溃的幂等性（子进程退出码 77）。
 
 ---
 
 ## 7. 设计取舍（一致性的边界）
 
-- "真实后端"是进程内模拟，且**未**跨重启持久化：这刻意模拟"控制面已记录但后端
-  状态需要重新对齐"的情形。重启后控制器依据持久化的期望与状态幂等地重新收敛，
-  最坏情况是一次幂等对齐，而不是重复副作用。
+- "真实后端"是进程内模拟，但实际资源通过 `actual.DirStore`（每资源一个 JSON 文件、
+  fsync+rename 原子写）**跨重启持久化**，精确模拟"磁盘上的真实资源"；它不模拟
+  远端 API 的网络分区/部分失败语义。资源身份由对象名确定性派生，跨重启稳定；
+  对账只在"控制面无此对象"这一确定依据下删除实际资源，归属不确定的资源一律保留并
+  交给调和——宁可多留一轮，绝不误删仍然有效的资源。
 - 存储是单进程内存 + 文件快照；它精确模拟了 etcd 风格的单调 rv 与 CAS 语义，
   但不模拟网络分区。一致性论证因此限定在"单控制面、进程内/崩溃重启"模型内。
 - 所有时间与抖动都可注入（`Clock`、`jitter func`），失败可注入（`FailureRule`），

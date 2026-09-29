@@ -69,6 +69,29 @@ func (s *MemStore) List(_ context.Context) ([]*apis.RawObject, error) {
 	return out, nil
 }
 
+// ListKeysPage returns up to limit stored object names strictly after
+// cursor, in lexicographic order, plus the continuation cursor ("" when
+// the scan is finished). It lets startup/recovery enqueue objects page by
+// page instead of materialising the whole store.
+func (s *MemStore) ListKeysPage(_ context.Context, cursor string, limit int) ([]string, string, error) {
+	if limit <= 0 {
+		return nil, "", fmt.Errorf("storage: page limit must be positive, got %d", limit)
+	}
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	names := make([]string, 0, len(s.data))
+	for n := range s.data {
+		if n > cursor {
+			names = append(names, n)
+		}
+	}
+	sort.Strings(names)
+	if len(names) <= limit {
+		return names, "", nil
+	}
+	return names[:limit], names[limit-1], nil
+}
+
 // Create inserts a new object. It is stored at resource version 1.
 func (s *MemStore) Create(_ context.Context, obj *apis.RawObject) (*apis.RawObject, int64, error) {
 	if obj == nil || obj.Metadata.Name == "" {

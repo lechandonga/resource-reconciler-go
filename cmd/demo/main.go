@@ -20,6 +20,7 @@ import (
 	"path/filepath"
 	"time"
 
+	"github.com/lechandonga/resource-reconciler-go/pkg/actual"
 	"github.com/lechandonga/resource-reconciler-go/pkg/apis"
 	"github.com/lechandonga/resource-reconciler-go/pkg/controller"
 	"github.com/lechandonga/resource-reconciler-go/pkg/engine"
@@ -28,15 +29,19 @@ import (
 
 func main() {
 	snapPath := flag.String("snapshot", filepath.Join(os.TempDir(), "reconciler-demo-snapshot.json"), "snapshot file used for the restart step")
+	actualDir := flag.String("actual-dir", filepath.Join(os.TempDir(), "reconciler-demo-actual"), "directory backing the durable actual resources")
 	flag.Parse()
 
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 
 	store := storage.NewMemStore()
-	act := engine.NewFakeActuator()
+	actualStore, err := actual.NewDirStore(ctx, *actualDir)
+	must(err)
+	act := engine.NewFakeActuatorWithStore(actualStore)
 	clk := engine.RealClock{}
 	sink := &engine.WriterSink{W: os.Stdout}
+	act.SetCrashHook(engine.EnvCrashHook())
 
 	c, err := controller.New(controller.Config{
 		Workers:       2,
@@ -131,11 +136,15 @@ func main() {
 
 	store2 := storage.NewMemStore()
 	must(store2.LoadFile(*snapPath))
-	act2 := engine.NewFakeActuator()
 	ctx2, cancel2 := context.WithCancel(context.Background())
+	actualStore2, err := actual.NewDirStore(ctx2, *actualDir)
+	must(err)
+	act2 := engine.NewFakeActuatorWithStore(actualStore2)
+	act2.SetCrashHook(engine.EnvCrashHook())
 	c2, err := controller.New(controller.Config{
 		Workers: 4, QueueCapacity: 32, Store: store2, Actuator: act2,
 		Clock: engine.RealClock{}, Backoff: engine.DefaultBackoff(), Sink: sink, Jitter: deterministicHalfJitter,
+		RecoveryPageSize: 16,
 	})
 	must(err)
 	go func() { _ = c2.Run(ctx2) }()
@@ -145,6 +154,7 @@ func main() {
 	fmt.Printf("after restart: %d objects re-loaded; legacy side effects before=%d after(new backend)=%d\n",
 		len(all), effectsBefore, act2.SideEffectCount("legacy"))
 	dump(ctx2, store2, "legacy")
+	fmt.Printf("durable actual resources kept in %q across the restart\n", *actualDir)
 	fmt.Println("demo complete")
 }
 

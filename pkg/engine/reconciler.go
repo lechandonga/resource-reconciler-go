@@ -258,6 +258,24 @@ func (r *Reconciler) pass(ctx context.Context, obj *apis.RawObject, rv int64) (R
 		return res, nrv, err
 	}
 
+	// Bookkeeping lag detection (crash between action and record): the
+	// backend already had a resource for a key whose persisted status did
+	// not know about one, or its identity differs from what was recorded.
+	// Ensure adopted/adopted-to it in place (no duplicate creation); make
+	// the decision auditable.
+	if action != ActionCreated && st.Actual == nil {
+		r.log(Decision{Key: obj.Metadata.Name, Action: "actual-adopted",
+			Reason:  apis.ReasonActualKept,
+			Message: "backend already held an unbooked resource; adopted it in place (not recreated)",
+			Input:   inputSummary(obj)})
+	}
+	if st.Actual != nil && newActual != nil && st.Actual.ResourceID != newActual.ResourceID {
+		r.log(Decision{Key: obj.Metadata.Name, Action: "actual-identity-adopted",
+			Reason: apis.ReasonActualKept,
+			Message: fmt.Sprintf("backend identity %q adopted over recorded %q",
+				newActual.ResourceID, st.Actual.ResourceID), Input: inputSummary(obj)})
+	}
+
 	// success path. Persist only when something semantically changed:
 	// an already-converged object must not be rewritten on every pass.
 	dirty := false

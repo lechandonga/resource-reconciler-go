@@ -18,6 +18,14 @@ import (
 const (
 	DefaultWorkers       = 2
 	DefaultQueueCapacity = 128
+	// DefaultRecoveryPageSize bounds how many keys one recovery page
+	// holds, so a very large actual/control side cannot be pulled into
+	// memory in one shot.
+	DefaultRecoveryPageSize = 64
+	// DefaultRecoveryTimeout bounds a single startup/resync audit pass;
+	// cancellation or expiry ends the pass promptly with a distinct,
+	// observable reason, and the next pass resumes paging.
+	DefaultRecoveryTimeout = 30 * time.Second
 	// maxObjectSize bounds an individual spec JSON blob so one huge object
 	// cannot exhaust process memory.
 	maxObjectSize = 64 * 1024
@@ -39,6 +47,11 @@ type Config struct {
 	// ResyncPeriod re-enqueues every object periodically so missed
 	// signals self-heal. Zero disables it.
 	ResyncPeriod time.Duration
+	// RecoveryPageSize bounds keys scanned per page during startup and
+	// periodic actual-side reconciliation. Non-positive uses the default.
+	RecoveryPageSize int
+	// RecoveryTimeout bounds one audit pass. Non-positive uses default.
+	RecoveryTimeout time.Duration
 }
 
 // Controller is the runnable declarative controller.
@@ -54,6 +67,7 @@ type Controller struct {
 	inFlight   int
 	processed  int64
 	overflowed int64
+	reclaimed  int64
 }
 
 // New constructs a controller with validated defaults.
@@ -79,6 +93,12 @@ func New(cfg Config) (*Controller, error) {
 	if cfg.Sink == nil {
 		cfg.Sink = engine.NopSink{}
 	}
+	if cfg.RecoveryPageSize <= 0 {
+		cfg.RecoveryPageSize = DefaultRecoveryPageSize
+	}
+	if cfg.RecoveryTimeout <= 0 {
+		cfg.RecoveryTimeout = DefaultRecoveryTimeout
+	}
 	q := engine.NewKeyQueue(cfg.QueueCapacity, cfg.Clock)
 	rec := engine.NewReconciler(cfg.Store, cfg.Actuator, cfg.Clock, cfg.Backoff, cfg.Sink).
 		WithDependencyQueue(q).
@@ -102,13 +122,15 @@ type Stats struct {
 	InFlight   int
 	Processed  int64
 	Overflowed int64
+	Reclaimed  int64
 }
 
 // Stats returns counters describing the bounded-work behaviour.
 func (c *Controller) Stats() Stats {
 	c.idleMu.Lock()
 	defer c.idleMu.Unlock()
-	return Stats{Waiting: c.queue.Len(), InFlight: c.inFlight, Processed: c.processed, Overflowed: c.overflowed}
+	return Stats{Waiting: c.queue.Len(), InFlight: c.inFlight, Processed: c.processed,
+		Overflowed: c.overflowed, Reclaimed: c.reclaimed}
 }
 
 // Run starts the worker pool and an optional resync loop and blocks
@@ -131,16 +153,25 @@ func (c *Controller) Run(ctx context.Context) error {
 			c.resyncLoop(ctx)
 		}()
 	}
-	// Restart resume: enqueue every persisted object once.
-	if err := c.enqueueAll(ctx); err != nil {
-		c.log("startup", ReasonResync, "startup enqueue failed: %v", err)
-	} else {
-		c.log("startup", "Resumed", "enqueued persisted objects")
-	}
+	// Restart resume and actual-side ownership audit run in their own
+	// goroutine: startup must not block while a very large side is paged
+	// through, and desired-state writes stay accepted throughout.
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		c.startupRecovery(ctx)
+	}()
 	<-ctx.Done()
 	c.queue.Close()
 	wg.Wait()
 	return ctx.Err()
+}
+
+// startupRecovery enqueues every persisted object (bounded pages) and
+// audits the durable actual side for orphans. Everything is paged,
+// cancellable and time-bounded.
+func (c *Controller) startupRecovery(ctx context.Context) {
+	c.reconcileOnce(ctx, "startup")
 }
 
 func (c *Controller) worker(ctx context.Context) {
@@ -190,27 +221,125 @@ func (c *Controller) resyncLoop(ctx context.Context) {
 		case <-ctx.Done():
 			return
 		case <-ticker:
-			if err := c.enqueueAll(ctx); err != nil {
-				c.log("resync", ReasonResync, "%v", err)
-			}
+			c.reconcileOnce(ctx, "resync")
 		}
 	}
 }
 
-// enqueueAll enqueues every currently stored object once (deduped).
-func (c *Controller) enqueueAll(ctx context.Context) error {
-	all, err := c.store.List(ctx)
-	if err != nil {
-		return err
-	}
-	for _, o := range all {
-		if err := c.queue.Add(o.Metadata.Name); err != nil {
-			// A full queue is expected under backlog: record it and keep
-			// going; resync will pick up the ones we skipped.
-			c.recordOverflow(o.Metadata.Name, err)
+// reconcileOnce performs one bounded, cancellable audit pass:
+//  1. enqueue every control-plane object in pages (resume unfinished
+//     work / correct drift), then
+//  2. page through the durable actual side and reclaim definite orphans.
+//
+// It never loads either side wholesale into memory and never blocks
+// longer than RecoveryTimeout; on cancel/timeout it returns promptly and
+// records a distinct reason. Re-entrant: interrupted passes are safely
+// repeated by the next startup/resync.
+func (c *Controller) reconcileOnce(parent context.Context, phase string) {
+	ctx, cancel := context.WithTimeout(parent, c.cfg.RecoveryTimeout)
+	defer cancel()
+
+	page := c.cfg.RecoveryPageSize
+
+	// Phase A: desired/control side, paged.
+	var cursor string
+	enqueued := 0
+	for {
+		if err := ctx.Err(); err != nil {
+			c.recordRecoveryStop(phase, err)
+			return
 		}
+		keys, next, err := c.store.ListKeysPage(ctx, cursor, page)
+		if err != nil {
+			c.log(phase, ReasonResync, "control-side page failed: %v", err)
+			return
+		}
+		for _, k := range keys {
+			if err := ctx.Err(); err != nil {
+				c.recordRecoveryStop(phase, err)
+				return
+			}
+			if err := c.queue.Add(k); err != nil {
+				// Full queue under backlog is expected: record it; the
+				// next pass picks the key up.
+				c.recordOverflow(k, err)
+			} else {
+				enqueued++
+			}
+		}
+		if next == "" {
+			break
+		}
+		cursor = next
 	}
-	return nil
+
+	// Phase B: actual side ownership audit, paged. Only an actuator with
+	// a durable, scannable backend participates.
+	lister, ok := c.cfg.Actuator.(engine.ActualLister)
+	if !ok {
+		c.log(phase, "Resumed", "enqueued %d persisted objects; actual side not scannable", enqueued)
+		return
+	}
+	actualStore := lister.Actual()
+	var acursor string
+	reclaimed := 0
+	kept := 0
+	for {
+		if err := ctx.Err(); err != nil {
+			c.recordRecoveryStop(phase, err)
+			return
+		}
+		keys2, next, err := actualStore.ListPage(ctx, acursor, page)
+		if err != nil {
+			c.log(phase, ReasonResync, "actual-side page failed: %v", err)
+			return
+		}
+		for _, k := range keys2 {
+			if err := ctx.Err(); err != nil {
+				c.recordRecoveryStop(phase, err)
+				return
+			}
+			dec, rerr := c.rec.ReapOrphan(ctx, k)
+			if rerr != nil {
+				c.log(k, "RecoveryError", "%v", rerr)
+				continue
+			}
+			switch dec {
+			case engine.ReapRemoved:
+				reclaimed++
+				c.idleMu.Lock()
+				c.reclaimed++
+				c.idleMu.Unlock()
+			case engine.ReapKept:
+				kept++
+			case engine.ReapEnqueued:
+				// Inconclusive ownership: ordinary reconciliation makes
+				// the durable decision. Queue-full is handled like above.
+				if err := c.queue.Add(k); err != nil {
+					c.recordOverflow(k, err)
+				}
+				kept++
+			}
+		}
+		if next == "" {
+			break
+		}
+		acursor = next
+	}
+	c.log(phase, "Resumed",
+		"audit complete: enqueued=%d actual-kept=%d orphans-reclaimed=%d", enqueued, kept, reclaimed)
+}
+
+// recordRecoveryStop logs a distinguishable reason when an audit pass is
+// interrupted before completion.
+func (c *Controller) recordRecoveryStop(phase string, err error) {
+	switch {
+	case errors.Is(err, context.DeadlineExceeded):
+		c.log(phase, apis.ReasonRecoveryTimedOut,
+			"recovery pass exceeded %s; remaining pages deferred to next pass", c.cfg.RecoveryTimeout)
+	default:
+		c.log(phase, apis.ReasonRecoveryCancelled, "recovery pass cancelled: %v", err)
+	}
 }
 
 func (c *Controller) recordOverflow(key string, err error) {

@@ -126,6 +126,12 @@ const (
 	ReasonRetryBudgetExhausted = "RetryBudgetExhausted"
 	ReasonQueueOverflow        = "QueueOverflow"
 	ReasonConflict             = "Conflict"
+	// Startup / recovery reconciliation (actual-side ownership audit).
+	ReasonOrphanReclaimed      = "OrphanReclaimed"
+	ReasonActualKept           = "ActualKept"
+	ReasonRecoveryCancelled    = "RecoveryCancelled"
+	ReasonRecoveryTimedOut     = "RecoveryTimedOut"
+	ReasonActualDriftCorrected = "ActualDriftCorrected"
 )
 
 // AdmissionError is returned for specs that must be rejected. The Reason
