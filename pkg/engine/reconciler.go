@@ -20,6 +20,29 @@ import (
 // it is an expected multi-step transition, not a failed write.
 var errContinue = errors.New("continue reconciliation")
 
+// CrashPoint identifies a precise moment in the action/record sequence
+// that tests can crash the process at, to exercise recovery windows.
+type CrashPoint string
+
+const (
+	// CrashAfterEnsure fires after the actuator has committed an Ensure
+	// (create/update/adopt, durably persisted in the actual backend) but
+	// before any result is written to the control-plane store.
+	CrashAfterEnsure CrashPoint = "AfterEnsure"
+	// CrashAfterRemove fires after the actuator has durably removed the
+	// actual resource but before st.Actual=nil is recorded.
+	CrashAfterRemove CrashPoint = "AfterRemove"
+)
+
+// ErrInjectedCrash is returned to the caller when a crash hook fired. It
+// simulates an abrupt process termination at the hook point: the current
+// reconcile pass stops immediately with no further store write.
+var ErrInjectedCrash = errors.New("injected crash at reconciliation barrier")
+
+// CrashHook is invoked at a CrashPoint. Returning true aborts the pass
+// with ErrInjectedCrash right there, modelling SIGKILL at that instant.
+type CrashHook func(key string, at CrashPoint) bool
+
 // Result tells the controller how to schedule the next attempt.
 type Result struct {
 	RequeueAfter time.Duration
@@ -52,6 +75,7 @@ type Reconciler struct {
 	sink    DecisionSink
 	jitter  func() float64
 	deps    DependencyEnqueuer
+	crash   CrashHook
 
 	mu sync.Mutex
 }
@@ -74,6 +98,22 @@ func (r *Reconciler) WithDependencyQueue(q DependencyEnqueuer) *Reconciler {
 func (r *Reconciler) WithJitter(j func() float64) *Reconciler {
 	r.jitter = j
 	return r
+}
+
+// WithCrashHook installs a barrier that aborts reconciliation at the
+// named point (test support for crash-window recovery).
+func (r *Reconciler) WithCrashHook(h CrashHook) *Reconciler {
+	r.crash = h
+	return r
+}
+
+func (r *Reconciler) crashBarrier(key string, at CrashPoint) error {
+	if r.crash != nil && r.crash(key, at) {
+		r.log(Decision{Key: key, Action: "crash", Reason: "InjectedCrash",
+			Message: "simulated process kill " + string(at)})
+		return ErrInjectedCrash
+	}
+	return nil
 }
 
 // Reconcile performs one bounded convergence pass for key. Store
@@ -257,6 +297,12 @@ func (r *Reconciler) pass(ctx context.Context, obj *apis.RawObject, rv int64) (R
 		res, nrv, err := r.recordActuatorError(ctx, obj, rv, now, gen, aerr)
 		return res, nrv, err
 	}
+	// The action has taken effect in the (durable) actual backend. If the
+	// process is killed exactly here, the control-plane record still
+	// shows the old/empty actual; restart reconciliation adopts it.
+	if cerr := r.crashBarrier(obj.Metadata.Name, CrashAfterEnsure); cerr != nil {
+		return Result{}, 0, cerr
+	}
 
 	// success path. Persist only when something semantically changed:
 	// an already-converged object must not be rewritten on every pass.
@@ -288,6 +334,12 @@ func (r *Reconciler) pass(ctx context.Context, obj *apis.RawObject, rv int64) (R
 		reason = apis.ReasonCreated
 	case ActionUpdated:
 		reason = apis.ReasonUpdated
+	case ActionAdopted:
+		// The resource already existed in the durable backend but the
+		// control plane had not recorded it (crash between action and
+		// record). Adopt the existing identity: content and identity stay
+		// exactly as they are, no side effect is counted.
+		reason = "Adopted"
 	case ActionUnchanged:
 		reason = apis.ReasonUnchanged
 	}
@@ -368,6 +420,12 @@ func (r *Reconciler) passDelete(ctx context.Context, obj *apis.RawObject, rv int
 			setCondition(obj, now, apis.CondProgressing, "True", apis.ReasonDeleting,
 				"deletion in progress: "+aerr.Error(), gen)
 			return r.recordActuatorError(ctx, obj, rv, now, gen, aerr)
+		}
+		// The backend removal is durably committed. A crash here leaves an
+		// actual-state record that points at something already gone; the
+		// next pass observes Remove no-op and finishes the phases.
+		if cerr := r.crashBarrier(obj.Metadata.Name, CrashAfterRemove); cerr != nil {
+			return Result{}, 0, cerr
 		}
 		// Remove is idempotent: deleted==false means it was already gone
 		// in the backend but our status still thought it existed. Either

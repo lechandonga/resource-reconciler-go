@@ -36,9 +36,15 @@ type Config struct {
 	Backoff       engine.BackoffPolicy
 	Sink          engine.DecisionSink
 	Jitter        func() float64
+	// CrashHook, when set, aborts a reconcile pass at the named barrier
+	// (test support for crash-window recovery).
+	CrashHook engine.CrashHook
 	// ResyncPeriod re-enqueues every object periodically so missed
 	// signals self-heal. Zero disables it.
 	ResyncPeriod time.Duration
+	// Recovery bounds the startup actual-side reconciliation. The zero
+	// value disables the sweep (useful for ephemeral backends/tests).
+	Recovery RecoveryConfig
 }
 
 // Controller is the runnable declarative controller.
@@ -50,10 +56,12 @@ type Controller struct {
 	clk   engine.Clock
 	sink  engine.DecisionSink
 
-	idleMu     sync.Mutex
-	inFlight   int
-	processed  int64
-	overflowed int64
+	idleMu       sync.Mutex
+	inFlight     int
+	processed    int64
+	overflowed   int64
+	recMu        sync.Mutex
+	lastRecovery RecoveryStats
 }
 
 // New constructs a controller with validated defaults.
@@ -82,7 +90,8 @@ func New(cfg Config) (*Controller, error) {
 	q := engine.NewKeyQueue(cfg.QueueCapacity, cfg.Clock)
 	rec := engine.NewReconciler(cfg.Store, cfg.Actuator, cfg.Clock, cfg.Backoff, cfg.Sink).
 		WithDependencyQueue(q).
-		WithJitter(cfg.Jitter)
+		WithJitter(cfg.Jitter).
+		WithCrashHook(cfg.CrashHook)
 	return &Controller{
 		cfg:   cfg,
 		store: cfg.Store,
@@ -102,13 +111,17 @@ type Stats struct {
 	InFlight   int
 	Processed  int64
 	Overflowed int64
+	Recovery   RecoveryStats
 }
 
 // Stats returns counters describing the bounded-work behaviour.
 func (c *Controller) Stats() Stats {
 	c.idleMu.Lock()
 	defer c.idleMu.Unlock()
-	return Stats{Waiting: c.queue.Len(), InFlight: c.inFlight, Processed: c.processed, Overflowed: c.overflowed}
+	c.recMu.Lock()
+	rec := c.lastRecovery
+	c.recMu.Unlock()
+	return Stats{Waiting: c.queue.Len(), InFlight: c.inFlight, Processed: c.processed, Overflowed: c.overflowed, Recovery: rec}
 }
 
 // Run starts the worker pool and an optional resync loop and blocks
@@ -130,6 +143,16 @@ func (c *Controller) Run(ctx context.Context) error {
 			defer wg.Done()
 			c.resyncLoop(ctx)
 		}()
+	}
+	// Startup: reconcile the durable actual side against durable
+	// ownership FIRST (bounded, paged, cancellable), then enqueue every
+	// persisted object so unfinished work resumes. The sweep itself
+	// enqueues owned resources; the second enqueue is deduped.
+	if c.cfg.Recovery.PageSize > 0 {
+		st := c.reconcileActual(ctx, c.cfg.Recovery)
+		c.recMu.Lock()
+		c.lastRecovery = st
+		c.recMu.Unlock()
 	}
 	// Restart resume: enqueue every persisted object once.
 	if err := c.enqueueAll(ctx); err != nil {
@@ -167,6 +190,10 @@ func (c *Controller) worker(ctx context.Context) {
 		switch {
 		case rerr != nil && errors.Is(rerr, context.Canceled):
 			return
+		case rerr != nil && errors.Is(rerr, engine.ErrInjectedCrash):
+			// Simulated kill at an action/record barrier. No requeue here:
+			// the real process would restart and run startup reconciliation.
+			c.log(key, "InjectedCrash", "pass aborted to simulate process kill")
 		case rerr != nil:
 			c.log(key, "WorkerError", "%v", rerr)
 		case res.RequeueAfter > 0:
@@ -197,20 +224,35 @@ func (c *Controller) resyncLoop(ctx context.Context) {
 	}
 }
 
-// enqueueAll enqueues every currently stored object once (deduped).
+// enqueueAll enqueues every currently stored object once (deduped),
+// paging through the store so a large control plane never has to be
+// loaded wholesale and so cancellation is observed between pages.
 func (c *Controller) enqueueAll(ctx context.Context) error {
-	all, err := c.store.List(ctx)
-	if err != nil {
-		return err
-	}
-	for _, o := range all {
-		if err := c.queue.Add(o.Metadata.Name); err != nil {
-			// A full queue is expected under backlog: record it and keep
-			// going; resync will pick up the ones we skipped.
-			c.recordOverflow(o.Metadata.Name, err)
+	const pageSize = 128
+	cursor := ""
+	for {
+		if err := ctx.Err(); err != nil {
+			return err
 		}
+		names, next, err := c.store.Keys(ctx, cursor, pageSize)
+		if err != nil {
+			return err
+		}
+		for _, name := range names {
+			if ctx.Err() != nil {
+				return ctx.Err()
+			}
+			if err := c.queue.Add(name); err != nil {
+				// A full queue is expected under backlog: record it and
+				// keep going; resync picks up the ones we skipped.
+				c.recordOverflow(name, err)
+			}
+		}
+		if next == "" {
+			return nil
+		}
+		cursor = next
 	}
-	return nil
 }
 
 func (c *Controller) recordOverflow(key string, err error) {

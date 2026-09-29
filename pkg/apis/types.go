@@ -126,6 +126,15 @@ const (
 	ReasonRetryBudgetExhausted = "RetryBudgetExhausted"
 	ReasonQueueOverflow        = "QueueOverflow"
 	ReasonConflict             = "Conflict"
+
+	// Startup/actual-side reconciliation reasons.
+	ReasonRecoveryAdopted   = "RecoveryAdopted"
+	ReasonRecoveryReclaimed = "RecoveryReclaimed"
+	ReasonRecoveryRetained  = "RecoveryRetained"
+	ReasonRecoveryCancelled = "RecoveryCancelled"
+	ReasonRecoveryTimedOut  = "RecoveryTimedOut"
+	ReasonRecoveryPartial   = "RecoveryPartial"
+	ReasonRecoveryMigrated  = "RecoveryMigrated"
 )
 
 // AdmissionError is returned for specs that must be rejected. The Reason

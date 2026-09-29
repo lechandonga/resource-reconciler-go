@@ -19,7 +19,7 @@
                                                            └─ CAS write (optimistic lock)
         ◄──────────────  DecisionSink (reason-coded log) ─┘
  MemStore (in-memory + atomic snapshot file, monotonic resourceVersion)
- FakeActuator (idempotent backend + transient/deterministic failure injection)
+ FakeActuator (idempotent, DURABLE actual backend file + transient/deterministic failure injection)
 ```
 
 - `pkg/apis`：版本化 wire 类型、严格解码、确定性默认值、跨对象校验、状态条件与原因码。
@@ -29,6 +29,8 @@
   带乐观锁重试与失败分类的调和核心。
 - `pkg/controller`：装配（worker 池、启动恢复、周期 resync、bounded 处理）与
   对期望状态的 `Apply` / `Delete`。
+- `pkg/controller/recovery.go`：**启动实际侧对账**。分页扫描持久化实际后端，
+  按持久化所有权事实判定保留/接管/清理，有界、可取消、可超时、幂等可重入。
 - `cmd/demo`：覆盖全部语义的本地演示，逐步打印**输入、判定（含原因码）、最终状态**。
 
 ---
@@ -132,10 +134,12 @@
   关闭抖动源（传 `nil`）时结果完全确定，测试可复现。
 - 新的期望 generation 会**清空旧的失败/重试计数**，新输入不被旧失败绑架；
   同 generation 的重读不会被误判为"规格变更"。
-- **重启续作**：attempts、终态原因、`actual`、finalizer、删除时间戳全部持久化。
-  重启时把所有持久化对象入队一次，从已持久化阶段继续：
-  已生效的副作用不重复（执行器 `Remove` 对"已不存在"返回 no-op，
-  `Ensure` 对"已匹配"返回 `Unchanged`）。
+- **重启续作（控制面 + 实际面双重持久化）**：attempts、终态原因、`actual`、
+  finalizer、删除时间戳持久化在控制面快照；真实资源身份与内容持久化在实际侧文件。
+  重启先跑**有界启动对账**（见 7.1–7.3），再把所有持久化对象入队一次，从已持久化
+  阶段继续：已生效的副作用不重复（执行器 `Remove` 对"已不存在"返回 no-op，
+  `Ensure` 对"已匹配"返回 `Unchanged`，对"资源存在但记账缺失"返回 `Adopted`
+  而非再次创建）。
 
 ---
 
@@ -173,9 +177,22 @@ CGO_ENABLED=1 go test ./... -race -count=1
 CGO_ENABLED=1 go test ./... -race -count=5
 
 # 可运行演示：正常收敛、幂等、漂移修正、非法拒绝、瞬时/确定性失败、
-# 有序删除、重启续作，逐步打印输入/判定/最终状态
+# 有序删除、重启续作（实际身份/副作用不变），逐步打印输入/判定/最终状态
 go run ./cmd/demo
+
+# 崩溃窗口重现：在"动作已生效、记账未落"的精确点强杀，再单独恢复
+DIR=$(mktemp -d)
+go run ./cmd/demo -snapshot $DIR/store.json -actual $DIR/actual.json \
+  -crash AfterEnsure -crash-key a          # 进程以退出码 42 停在屏障
+go run ./cmd/demo -snapshot $DIR/store.json -actual $DIR/actual.json \
+  -recover-only                            # 对账+接管：身份 res-N 不变、0 副作用
+go run ./cmd/demo -snapshot $DIR/store.json -actual $DIR/actual.json \
+  -recover-only                            # 再跑一次：Unchanged，结果幂等
+# 删除窗口同理：把 -crash 换成 AfterRemove
 ```
+
+`-recover-only` 会打印每个对象的 `actualID`（实际侧身份）、`recordedID`
+（控制面记录身份）、是否在删除、以及本生命周期的副作用数，便于直接断言重启无感。
 
 ### 主要测试（以异常路径为主）
 
@@ -185,6 +202,8 @@ go run ./cmd/demo
   快照重启后 rv 语义保留、损坏/未知格式快照被拒绝。
 - `pkg/engine/actuator_test.go`：幂等 create/update/remove、瞬时预算耗尽后成功、
   确定性失败永不创建资源、副作用审计。
+- `pkg/engine/actuator_durable_test.go`：实际侧跨重启**身份不变**、接管不计副作用、
+  删除跨重启不复活、实际 key 分页有序枚举。
 - `pkg/engine/reconciler_test.go`：创建后幂等、漂移修正、依赖门控与删除保护、
   瞬时退避后收敛、确定性失败终态不空转、准入拒绝零副作用、换 generation 清除旧失败。
 - `pkg/engine/queue_test.go`：去重/FIFO、容量上界溢出、in-flight 同 key 互斥、
@@ -192,15 +211,82 @@ go run ./cmd/demo
 - `pkg/controller/controller_test.go`：并发热点对象收敛一致且执行器不并发、
   非法 spec 写库前被拒、队列溢出被拒绝并计数、**重启后续作且不重复副作用**、
   **重启续作删除不留孤儿**。
+- `pkg/controller/recovery_test.go`（本轮）：
+  - `TestRestartKeepsActualIdentityAndNoDuplicateSideEffects`：连续 3 次重启，
+    身份/数量/内容不变、新生命周期 0 副作用；
+  - `TestCrashBetweenEnsureAndRecordIsRecovered`：创建动作已生效、记账前强杀，
+    重启后以同一身份 `Adopted`、0 副作用并 Ready；
+  - `TestCrashBetweenRemoveAndRecordLeavesNoOrphan`：删除动作已生效、记账前强杀，
+    重启后无孤儿、对象彻底删除；
+  - `TestStartupReclaimsResidualsButKeepsOwned`：无主残留被清，finalizer 持有的资源
+    绝不误清、身份不变；
+  - `TestDriftIsCorrectedAcrossRestartKeepingIdentity`：手动改坏实际资源，重启纠偏、
+    身份保持、恰好一次更新；
+  - `TestLegacySnapshotTakenOverInPlace`：上一版本快照就地接管，身份逐字保留、
+    0 重建、`Migrated=1`；
+  - `TestWritesDuringRecoveryAreAcceptedAndConverge`：恢复扫描期间并发写入正常受理并收敛；
+  - `TestRecoveryCancellationReturnsPromptly` / `TestRecoveryTimeoutStopsAndResyncCompletes`：
+    取消立即返回、超时记录可区分原因且由 resync 补齐；
+  - `TestRepeatedCrashesDuringRecoveryAreIdempotent`：恢复过程中再次崩溃，结果仍幂等一致。
+
+  以上断言都落在可观察结果上（`ResourceID`、`SideEffectCount`、资源数量、
+  最终 Ready / 对象存在性、`Stats().Recovery`），并在 `-race -count=3` 下可复现。
 
 ---
 
 ## 7. 设计取舍（一致性的边界）
 
-- "真实后端"是进程内模拟，且**未**跨重启持久化：这刻意模拟"控制面已记录但后端
-  状态需要重新对齐"的情形。重启后控制器依据持久化的期望与状态幂等地重新收敛，
-  最坏情况是一次幂等对齐，而不是重复副作用。
-- 存储是单进程内存 + 文件快照；它精确模拟了 etcd 风格的单调 rv 与 CAS 语义，
-  但不模拟网络分区。一致性论证因此限定在"单控制面、进程内/崩溃重启"模型内。
+### 7.1 实际侧持久化与恢复语义（本轮新增）
+
+"真实后端"现在同样是**持久化**的：`FakeActuator` 每次**已提交**的变更（创建 /
+更新 / 删除）在调用返回前都以原子快照（temp + fsync + rename，`formatVersion=1`）
+落到独立的实际侧文件，资源身份（`ResourceID`）与 ID 计数器一并持久化。进程重启后
+`NewDurableFakeActuator(path)` **就地接管**该文件，因此：
+
+- 无外部改动时，重启多少次都不会再执行一次已经生效过的创建/更新/删除：
+  实际资源的**身份、数量、内容**保持不变，`SideEffectCount` 不因重启增长。
+- 手动改坏实际资源制造漂移后，重启时正常调和按期望内容纠偏，纠偏保持原身份。
+- 控制面对象里早已写下的 `status.actual` 可被**就地迁移**：若实际侧文件不存在
+  （上一版本的数据），启动时按对象分页读取，把带 finalizer 的对象已记录的实际资源
+  用 `Hydrate` 原样灌回实际侧，身份逐字保留、零创建副作用、无需清空重来
+  （决策 `RecoveryMigrated`，`Stats().Recovery.Migrated` 可观察）。
+
+**动作与记录之间的崩溃窗口**由"动作先落实际侧、再写控制面记录"的顺序 + 启动对账
+共同兜住。调和器在两个精确屏障暴露崩溃注入点（`CrashHook`）：
+
+| 屏障 | 崩溃时的持久化事实 | 重启后结论 |
+|---|---|---|
+| `AfterEnsure`（创建/更新/接管已提交，控制面尚未记录） | 实际侧有资源；控制面有 finalizer、`status.actual` 缺 | 启动判定**保留**，调和 `Ensure` 返回 `Adopted`：沿用既有身份，0 副作用 |
+| `AfterRemove`（删除已生效，`status.actual=nil` 尚未记录） | 实际侧已无资源；控制面仍有 finalizer+actual、带删除时间戳 | `Remove` 幂等 no-op，继续完成 finalizer 释放与对象删除，无孤儿 |
+
+### 7.2 对账（reconcile-actual）的归属判定规则
+
+判定**只依据持久化的控制面事实**，确定且可追溯（每条结论都有原因码日志）：
+
+- 实际资源的 key 在控制面**没有对象**：无主残留 → 删除（`RecoveryReclaimed`）。
+- 对象存在但**没有**控制器 finalizer：执行器在 finalizer 持久化之前从不被调用，
+  因此它不可能是在途创建，确定是孤儿 → 删除并入队收敛（`RecoveryReclaimed`）。
+- 对象**有** finalizer：控制器持久化持有该资源，**无条件保留**——无论控制面是否
+  已记录，都不会被误判成残留；记录缺失即"动作已生效、记账未落"，入队后由正常调和
+  以 `Adopted` 接管（`RecoveryRetained` / `RecoveryAdopted`）。
+
+对账**幂等可重入**：重复重启、或恢复过程中再次崩溃，结论一致；残留删除与资源接管
+都是幂等操作。
+
+### 7.3 有界与可取消
+
+- 启动扫描与旧数据迁移都**分页**（`ActualKeys` / `MemStore.Keys` 的 cursor +
+  pageSize），不会一次性把全部实际资源载入内存；页间按 `PagePause` 让出。
+- 扫描与迁移完全由 context 驱动：等待依赖就绪、退避重试、恢复扫描都响应取消与
+  `Timeout`。被取消/超时后尽快返回，并留下可区分原因
+  （`RecoveryCancelled` / `RecoveryTimedOut`，`Stats().Recovery` 可观察）；
+  未扫完的部分由周期 resync 幂等补齐。
+- 恢复在 worker 池启动后于后台进行，**恢复期间新的期望状态写入照常受理并最终收敛**；
+  工作队列仍是去重 + 硬容量上界，超载按既有策略返回 `QueueOverflow` 而不无界排队。
+
+### 7.4 边界
+
+- 存储是单进程内存 + 文件快照；它精确模拟 etcd 风格的单调 rv 与 CAS 语义，
+  但不模拟网络分区。一致性论证限定在"单控制面、进程内/崩溃重启"模型内。
 - 所有时间与抖动都可注入（`Clock`、`jitter func`），失败可注入（`FailureRule`），
-  因此异常路径测试是确定性的，而不是依赖真实睡眠或随机。
+  崩溃点可注入（`CrashHook`），因此异常路径测试是确定性的，而不是依赖真实睡眠或随机。

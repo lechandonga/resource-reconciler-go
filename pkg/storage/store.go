@@ -69,6 +69,31 @@ func (s *MemStore) List(_ context.Context) ([]*apis.RawObject, error) {
 	return out, nil
 }
 
+// Keys returns up to limit object names in sorted order starting
+// strictly after cursor. It is the bounded, resumable form of List used
+// by startup scans so that a very large store never has to be loaded
+// into memory at once.
+func (s *MemStore) Keys(_ context.Context, cursor string, limit int) ([]string, string, error) {
+	if limit <= 0 {
+		limit = 64
+	}
+	s.mu.RLock()
+	names := make([]string, 0, len(s.data))
+	for n := range s.data {
+		if n > cursor {
+			names = append(names, n)
+		}
+	}
+	s.mu.RUnlock()
+	sort.Strings(names)
+	var next string
+	if len(names) > limit {
+		names = names[:limit]
+		next = names[limit-1]
+	}
+	return names, next, nil
+}
+
 // Create inserts a new object. It is stored at resource version 1.
 func (s *MemStore) Create(_ context.Context, obj *apis.RawObject) (*apis.RawObject, int64, error) {
 	if obj == nil || obj.Metadata.Name == "" {
